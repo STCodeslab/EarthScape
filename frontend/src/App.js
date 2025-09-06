@@ -31,6 +31,7 @@ import ModelList from "./Component/ml/ModelList";
 import DetectionResults from "./Component/ml/DetectionResults";
 import ForecastTrainingCard from "./Component/ml/ForecastTrainingCard";
 import CorrelationAnalysisCard from "./Component/ml/CorrelationAnalysisCard";
+import CreateAlertCard from "./Component/ml/CreateAlertCard";
 
 
 
@@ -68,6 +69,7 @@ function App() {
         <Route path="/forecast-training" element={<ProtectedRoute><ForecastTrainingCard /></ProtectedRoute>} />
         <Route path="/correlation-analysis" element={<ProtectedRoute><CorrelationAnalysisCard /></ProtectedRoute>} />
         <Route path="/model-list" element={<ProtectedRoute><ModelList /></ProtectedRoute>} />
+        <Route path="/create-alert" element={<ProtectedRoute><CreateAlertCard /></ProtectedRoute>} />
         
 
          <Route path="/detection-results/:modelId" element={<DetectionResults />} />

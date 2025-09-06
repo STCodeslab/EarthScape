@@ -47,18 +47,18 @@ const Header = () => {
         <a href="index.html" className="logo">
           <div className="logo-mini w-30">
             <span className="light-logo">
-              <img src="../images/logo-letter.png" alt="logo" />
+              {/* <img src="../images/logo-letter.png" alt="logo" /> */}
             </span>
             <span className="dark-logo">
-              <img src="../images/logo-letter.png" alt="logo" />
+              {/* <img src="../images/logo-letter.png" alt="logo" /> */}
             </span>
           </div>
           <div className="logo-lg">
             <span className="light-logo">
-              <img src="../images/logo-dark-text.png" alt="logo" />
+              {/* <img src="../images/logo-dark-text.png" alt="logo" /> */}
             </span>
             <span className="dark-logo">
-              <img src="../images/logo-light-text.png" alt="logo" />
+              {/* <img src="../images/logo-light-text.png" alt="logo" /> */}
             </span>
           </div>
         </a>

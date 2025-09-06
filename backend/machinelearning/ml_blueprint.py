@@ -1,13 +1,15 @@
 # ml_blueprint.py
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
-import os, io, json, datetime as dt
+import os, io, json
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 import joblib
 from statsmodels.tsa.arima.model import ARIMA
 import warnings
+import datetime as dt
+
 warnings.filterwarnings("ignore")
 
 from statsmodels.tsa.stattools import acf
@@ -163,13 +165,7 @@ def list_models():
 @ml_bp.route("/anomaly/train", methods=["POST"])
 def anomaly_train():
     """
-    JSON body:
-    {
-      "dataset_name": "karachi_weather",
-      "dataset_id": "optional",
-      "target_field": "temperature",
-      "contamination": 0.02  // optional
-    }
+    Train IsolationForest for anomaly detection.
     """
     user_id, role, err = _auth_ok()
     if err: return jsonify({"error": err[0]}), err[1]
@@ -192,9 +188,8 @@ def anomaly_train():
         model = IsolationForest(n_estimators=200, contamination=contamination, random_state=42)
         model.fit(X)
 
-        # score training set for basic metrics
-        raw_scores = model.decision_function(X)  # higher is more normal
-        preds = model.predict(X)                 # 1 normal, -1 anomaly
+        raw_scores = model.decision_function(X)
+        preds = model.predict(X)
         anomaly_rate = float((preds == -1).mean())
 
         meta = {
@@ -216,27 +211,59 @@ def anomaly_train():
 
         model_id = _save_model_artifact(model, meta)
 
+        # --- ALERT CHECK + LOG ---
+        triggered = []
+        if len(tsdf) > 0:
+            latest_val = float(tsdf["value"].iloc[-1])
+            latest_ts = tsdf["ts"].iloc[-1]
+            active_alerts = list(db.alerts.find({
+                "user_id": ObjectId(user_id),
+                "dataset_name": dataset_name,
+                "field": target_field,
+                "active": True
+            }))
+            for alert in active_alerts:
+                trig = None
+                if alert["threshold_type"] == "above" and latest_val > alert["threshold_value"]:
+                    trig = f">{alert['threshold_value']}"
+                elif alert["threshold_type"] == "below" and latest_val < alert["threshold_value"]:
+                    trig = f"<{alert['threshold_value']}"
+
+                if trig:
+                    log_doc = {
+                        "alert_id": alert["_id"],
+                        "user_id": ObjectId(user_id),
+                        "dataset_name": dataset_name,
+                        "field": target_field,
+                        "value": latest_val,
+                        "ts": latest_ts,
+                        "triggered_at": datetime.utcnow(),
+                        "source": "anomaly_train"
+                    }
+                    db.alert_logs.insert_one(log_doc)
+
+                    triggered.append({
+                        "alert_id": str(alert["_id"]),
+                        "rule": trig,
+                        "value": latest_val,
+                        "ts": latest_ts.isoformat()
+                    })
+
         return jsonify({
             "model_id": model_id,
             "type": "anomaly_isoforest",
-            "metrics": meta["metrics"]
+            "metrics": meta["metrics"],
+            "alerts_triggered": triggered
         }), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @ml_bp.route("/anomaly/score", methods=["POST"])
 def anomaly_score():
     """
-    Score latest points or an incoming single point.
-
-    Body options:
-    1) Score latest N points from the original dataset:
-       { "model_id": "...", "latest_n": 50 }
-
-    2) Score a single new value (real-time):
-       { "model_id": "...", "value": 37.4 }
-       (Server rebuilds small context window from history for features)
+    Score dataset or new point(s) for anomalies.
     """
     user_id, role, err = _auth_ok()
     if err: return jsonify({"error": err[0]}), err[1]
@@ -252,11 +279,9 @@ def anomaly_score():
     try:
         model, meta, model_doc = _load_model_artifact(model_id)
 
-        # permissions: model owner or admin
         if role != "admin" and str(model_doc.get("user_id")) != str(user_id):
             return jsonify({"error": "Forbidden"}), 403
 
-        # Pull history to build features window
         tsdf = _load_timeseries_from_mongo(
             user_id=user_id if role != "admin" else str(model_doc.get("user_id")),
             role=role if role != "admin" else "admin",
@@ -266,15 +291,17 @@ def anomaly_score():
         )
 
         if new_value is not None:
-            # append the new value with current timestamp
-            tsdf = pd.concat([tsdf, pd.DataFrame({"ts": [pd.Timestamp.utcnow()], "value": [float(new_value)]})], ignore_index=True)
+            tsdf = pd.concat([
+                tsdf,
+                pd.DataFrame({"ts": [pd.Timestamp.utcnow()], "value": [float(new_value)]})
+            ], ignore_index=True)
 
         if latest_n:
             tsdf = tsdf.tail(int(latest_n))
 
         X = _make_features(tsdf)
-        scores = model.decision_function(X)  # higher is more normal
-        preds = model.predict(X)             # 1 normal, -1 anomaly
+        scores = model.decision_function(X)
+        preds = model.predict(X)
 
         out = []
         for i, row in tsdf.reset_index(drop=True).iterrows():
@@ -285,10 +312,52 @@ def anomaly_score():
                 "is_anomaly": bool(preds[i] == -1)
             })
 
-        return jsonify({"results": out[-(int(latest_n) if latest_n else len(out)) : ]}), 200
+        # --- ALERT CHECK + LOG ---
+        triggered = []
+        if len(out) > 0:
+            latest_val = out[-1]["value"]
+            latest_ts = out[-1]["ts"]
+            active_alerts = list(db.alerts.find({
+                "user_id": ObjectId(user_id),
+                "dataset_name": meta["dataset_name"],
+                "field": meta["target_field"],
+                "active": True
+            }))
+            for alert in active_alerts:
+                trig = None
+                if alert["threshold_type"] == "above" and latest_val > alert["threshold_value"]:
+                    trig = f">{alert['threshold_value']}"
+                elif alert["threshold_type"] == "below" and latest_val < alert["threshold_value"]:
+                    trig = f"<{alert['threshold_value']}"
+
+                if trig:
+                    log_doc = {
+                        "alert_id": alert["_id"],
+                        "user_id": ObjectId(user_id),
+                        "dataset_name": meta["dataset_name"],
+                        "field": meta["target_field"],
+                        "value": latest_val,
+                        "ts": latest_ts,
+                        "triggered_at": datetime.utcnow(),
+                        "source": "anomaly_score"
+                    }
+                    db.alert_logs.insert_one(log_doc)
+
+                    triggered.append({
+                        "alert_id": str(alert["_id"]),
+                        "rule": trig,
+                        "value": latest_val,
+                        "ts": latest_ts
+                    })
+
+        return jsonify({
+            "results": out[-(int(latest_n) if latest_n else len(out)):],
+            "alerts_triggered": triggered
+        }), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 
 @ml_bp.route("/models/<model_id>", methods=["DELETE"])
@@ -452,16 +521,17 @@ def forecast_train():
 @ml_bp.route("/forecast/predict", methods=["POST"])
 def forecast_predict():
     """
-    Predict next horizon steps.
+    Predict next horizon steps and auto-check + log alerts.
 
     Body:
     {
       "model_id": "...",
-      "horizon": 24               // steps ahead
+      "horizon": 24
     }
     """
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     body = request.get_json(force=True)
     model_id = body.get("model_id")
@@ -472,11 +542,11 @@ def forecast_predict():
     try:
         model, meta, model_doc = _load_model_artifact(model_id, ensure_type="forecast_arima")
 
-        # permissions: owner or admin
+        # permissions
         if role != "admin" and str(model_doc.get("user_id")) != str(user_id):
             return jsonify({"error": "Forbidden"}), 403
 
-        # Rebuild latest series to forecast from up-to-date data
+        # Rebuild series
         tsdf = _load_timeseries_from_mongo(
             user_id=user_id if role != "admin" else str(model_doc.get("user_id")),
             role=role if role != "admin" else "admin",
@@ -486,20 +556,21 @@ def forecast_predict():
         )
         y, freq = _to_timeseries(tsdf)
 
-        # If the stored model was trained earlier, refit to the full latest y using same order
+        # Refit ARIMA
         order = (meta["order"]["p"], meta["order"]["d"], meta["order"]["q"])
         refit = ARIMA(y, order=order).fit()
 
         forecast_res = refit.get_forecast(steps=horizon)
         mean = forecast_res.predicted_mean
-        conf = forecast_res.conf_int(alpha=0.05)  # 95% CI
+        conf = forecast_res.conf_int(alpha=0.05)
 
-        # Build timestamps for forecast horizon
         if freq:
-            idx = pd.date_range(start=y.index[-1] + pd.tseries.frequencies.to_offset(freq),
-                                periods=horizon, freq=freq)
+            idx = pd.date_range(
+                start=y.index[-1] + pd.tseries.frequencies.to_offset(freq),
+                periods=horizon,
+                freq=freq
+            )
         else:
-            # Fallback to simple integer steps if freq unknown
             idx = range(1, horizon + 1)
 
         out = []
@@ -512,12 +583,54 @@ def forecast_predict():
                 "yhat_upper": float(conf.iloc[i, 1])
             })
 
+        # ---- ALERT CHECK + LOG ----
+        triggered = []
+        if len(out) > 0:
+            latest_point = out[-1]
+            latest_val = latest_point["yhat"]
+            latest_ts = latest_point["ts"]
+
+            active_alerts = list(db.alerts.find({
+                "user_id": ObjectId(user_id),
+                "dataset_name": meta["dataset_name"],
+                "field": meta["target_field"],
+                "active": True
+            }))
+
+            for alert in active_alerts:
+                trig = None
+                if alert["threshold_type"] == "above" and latest_val > alert["threshold_value"]:
+                    trig = f">{alert['threshold_value']}"
+                elif alert["threshold_type"] == "below" and latest_val < alert["threshold_value"]:
+                    trig = f"<{alert['threshold_value']}"
+
+                if trig:
+                    log_doc = {
+                        "alert_id": alert["_id"],
+                        "user_id": ObjectId(user_id),
+                        "dataset_name": meta["dataset_name"],
+                        "field": meta["target_field"],
+                        "value": latest_val,
+                        "ts": latest_ts,
+                        "triggered_at": dt.datetime.utcnow(),
+                        "source": "forecast_predict"   # <--- added like anomaly_train
+                    }
+                    db.alert_logs.insert_one(log_doc)
+
+                    triggered.append({
+                        "alert_id": str(alert["_id"]),
+                        "rule": trig,
+                        "value": latest_val,
+                        "ts": latest_ts
+                    })
+
         return jsonify({
             "model_id": model_id,
             "target_field": meta["target_field"],
             "order": meta["order"],
             "freq": freq or meta.get("freq"),
-            "forecast": out
+            "forecast": out,
+            "alerts_triggered": triggered
         }), 200
 
     except Exception as e:
@@ -634,5 +747,162 @@ def correlation_matrix():
         corr_matrix = df_all.corr().to_dict()
 
         return jsonify({"matrix": corr_matrix, "fields": names}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+
+# --- ALERTS SYSTEM ---
+
+@ml_bp.route("/alerts/create", methods=["POST"])
+def create_alert():
+    """
+    Create a new alert rule.
+    Body:
+    {
+      "dataset_name": "karachi_weather",
+      "field": "temperature",
+      "threshold_type": "above",   # "above" | "below"
+      "threshold_value": 40
+    }
+    """
+    user_id, role, err = _auth_ok()
+    if err: return jsonify({"error": err[0]}), err[1]
+
+    body = request.get_json(force=True)
+    dataset_name = body.get("dataset_name")
+    field = body.get("field")
+    threshold_type = body.get("threshold_type")
+    threshold_value = body.get("threshold_value")
+
+    if not dataset_name or not field or not threshold_type or threshold_value is None:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    alert_doc = {
+        "user_id": ObjectId(user_id),
+        "role": role,
+        "dataset_name": dataset_name,
+        "field": field,
+        "threshold_type": threshold_type,
+        "threshold_value": float(threshold_value),
+        "active": True,
+        "created_at": datetime.utcnow()
+    }
+    db.alerts.insert_one(alert_doc)
+
+    return jsonify({"message": "✅ Alert created", "alert": str(alert_doc)}), 200
+
+
+@ml_bp.route("/alerts/fetch", methods=["GET"])
+def fetch_alerts():
+    """
+    Get all alerts for current user.
+    """
+    user_id, role, err = _auth_ok()
+    if err: return jsonify({"error": err[0]}), err[1]
+
+    alerts = list(db.alerts.find({"user_id": ObjectId(user_id)}))
+    for a in alerts:
+        a["_id"] = str(a["_id"])
+        a["user_id"] = str(a["user_id"])
+    return jsonify({"alerts": alerts}), 200
+
+
+@ml_bp.route("/alerts/check", methods=["POST"])
+def check_alerts():
+    """
+    Check all active alerts for current user and return triggered ones.
+    """
+    user_id, role, err = _auth_ok()
+    if err: return jsonify({"error": err[0]}), err[1]
+
+    active_alerts = list(db.alerts.find({"user_id": ObjectId(user_id), "active": True}))
+    triggered = []
+
+    for alert in active_alerts:
+        try:
+            tsdf = _load_timeseries_from_mongo(
+                user_id, role,
+                dataset_name=alert["dataset_name"],
+                dataset_id=None,
+                target_field=alert["field"]
+            )
+            if len(tsdf) == 0:
+                continue
+            latest_val = tsdf["value"].iloc[-1]
+
+            if alert["threshold_type"] == "above" and latest_val > alert["threshold_value"]:
+                triggered.append({
+                    "alert_id": str(alert["_id"]),
+                    "dataset": alert["dataset_name"],
+                    "field": alert["field"],
+                    "value": float(latest_val),
+                    "rule": f">{alert['threshold_value']}"
+                })
+            elif alert["threshold_type"] == "below" and latest_val < alert["threshold_value"]:
+                triggered.append({
+                    "alert_id": str(alert["_id"]),
+                    "dataset": alert["dataset_name"],
+                    "field": alert["field"],
+                    "value": float(latest_val),
+                    "rule": f"<{alert['threshold_value']}"
+                })
+        except Exception as e:
+            print("Error checking alert:", e)
+
+    return jsonify({"triggered": triggered}), 200
+
+@ml_bp.route("/alerts/logs", methods=["GET"])
+def get_alert_logs():
+    """
+    Fetch triggered alert logs for the authenticated user.
+
+    Query params:
+      ?limit=50     → limit number of logs (default 100)
+      ?dataset_name=...  → filter by dataset
+      ?field=...         → filter by field
+      ?alert_id=...      → filter by a specific alert
+    """
+    user_id, role, err = _auth_ok()
+    if err: 
+        return jsonify({"error": err[0]}), err[1]
+
+    try:
+        limit = int(request.args.get("limit", 100))
+        query = {}
+
+        # Admins can view all logs, normal users only theirs
+        if role != "admin":
+            query["user_id"] = ObjectId(user_id)
+
+        # Optional filters
+        if "dataset_name" in request.args:
+            query["dataset_name"] = request.args["dataset_name"]
+        if "field" in request.args:
+            query["field"] = request.args["field"]
+        if "alert_id" in request.args:
+            try:
+                query["alert_id"] = ObjectId(request.args["alert_id"])
+            except:
+                return jsonify({"error": "Invalid alert_id"}), 400
+
+        logs = list(db.alert_logs.find(query).sort("triggered_at", -1).limit(limit))
+
+        out = []
+        for log in logs:
+            out.append({
+                "log_id": str(log["_id"]),
+                "alert_id": str(log["alert_id"]),
+                "dataset_name": log["dataset_name"],
+                "field": log["field"],
+                "value": log["value"],
+                "ts": log["ts"].isoformat() if hasattr(log["ts"], "isoformat") else str(log["ts"]),
+                "triggered_at": log["triggered_at"].isoformat() if hasattr(log["triggered_at"], "isoformat") else str(log["triggered_at"]),
+                "source": log.get("source", "unknown")
+            })
+
+        return jsonify({"logs": out}), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500

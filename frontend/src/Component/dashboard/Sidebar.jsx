@@ -118,46 +118,61 @@ const Sidebar = () => {
     </ul>
   </li>
 
-  <li className="treeview">
-    <a href="#">
-      <i className="fa fa-database"></i>
-      <span>Datasets</span>
-      <span className="pull-right-container">
-        <i className="fa fa-angle-right pull-right"></i>
-      </span>
-    </a>
-    <ul className="treeview-menu">
-      <li>
-        <Link to="/upload-csv">
-          <i className="fa fa-upload"></i> Upload Datasets
-        </Link>
-      </li>
-      <li>
-        <Link to="/datasets">
-          <i className="fa fa-list"></i> <span>Datasets List</span>
-        </Link>
-      </li>
-      <li>
-        <Link to="/upload-weather-form">
-          <i className="fa fa-cloud-upload"></i> <span>Upload Weather Data</span>
-        </Link>
-      </li>
-      <li>
-        <Link to="/imagery-form">
-          <i className="fa fa-image"></i> <span>Fetch Satellite Imagery</span>
-        </Link>
-      </li>
-      <li>
-        <Link to="/imagery-list">
-          <i className="fa fa-picture-o"></i> <span>Satellite Imagery Library</span>
-        </Link>
-      </li>
-    </ul>
-  </li>
+ {/* Datasets Group */}
+<li className="treeview">
+  <a href="#">
+    <i className="fa fa-database"></i>
+    <span>Datasets</span>
+    <span className="pull-right-container">
+      <i className="fa fa-angle-right pull-right"></i>
+    </span>
+  </a>
+  <ul className="treeview-menu">
+    <li>
+      <Link to="/upload-csv">
+        <i className="fa fa-upload"></i> Upload Datasets
+      </Link>
+    </li>
+    <li>
+      <Link to="/datasets">
+        <i className="fa fa-list"></i> <span>Datasets List</span>
+      </Link>
+    </li>
+    <li>
+      <Link to="/upload-weather-form">
+        <i className="fa fa-cloud-upload"></i> <span>Upload Weather Data</span>
+      </Link>
+    </li>
+  </ul>
+</li>
+
+{/* Satellite Imagery Group */}
+<li className="treeview">
+  <a href="#">
+    <i className="fa fa-image"></i>
+    <span>Satellite Imagery</span>
+    <span className="pull-right-container">
+      <i className="fa fa-angle-right pull-right"></i>
+    </span>
+  </a>
+  <ul className="treeview-menu">
+    <li>
+      <Link to="/imagery-form">
+        <i className="fa fa-cloud-download"></i> <span>Fetch Imagery</span>
+      </Link>
+    </li>
+    <li>
+      <Link to="/imagery-list">
+        <i className="fa fa-picture-o"></i> <span>Imagery Library</span>
+      </Link>
+    </li>
+  </ul>
+</li>
+
 
   <li className="treeview">
   <a href="#">
-       <i className="fa fa-flask"></i>
+    <i className="fa fa-flask"></i>
     <span>Machine Learning</span>
     <span className="pull-right-container">
       <i className="fa fa-angle-right pull-right"></i>
@@ -165,8 +180,23 @@ const Sidebar = () => {
   </a>
   <ul className="treeview-menu">
     <li>
-        <Link to="/anomaly-training">
-        <i className="fa fa-cogs"></i> <span>Train Model</span>
+      <Link to="/dataprocessing">
+        <i className="fa fa-database"></i> <span>Data Processing</span>
+      </Link>
+    </li>
+    <li>
+      <Link to="/anomaly-training">
+        <i className="fa fa-random"></i> <span>Anomaly Training</span>
+      </Link>
+    </li>
+    <li>
+      <Link to="/forecast-training">
+        <i className="fa fa-line-chart"></i> <span>Forecast Training</span>
+      </Link>
+    </li>
+    <li>
+      <Link to="/correlation-analysis">
+        <i className="fa fa-bar-chart"></i> <span>Correlation Analysis</span>
       </Link>
     </li>
     <li>
