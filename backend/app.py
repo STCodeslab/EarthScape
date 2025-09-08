@@ -21,8 +21,11 @@ from ingestion.upload_imagery import upload_imagery_bp
 from processing.processing_bp import processing_bp
 
 from realtime.realtime import realtime_bp
+from realtime.realtime_alerts import alerts_bp 
 
 from machinelearning.ml_blueprint import ml_bp
+from scheduler.scheduler import start_scheduler
+
 
 
 
@@ -53,8 +56,10 @@ app.register_blueprint(upload_imagery_bp, url_prefix="/api")
 app.register_blueprint(processing_bp, url_prefix="/api")
 
 app.register_blueprint(realtime_bp, url_prefix="/api")
+app.register_blueprint(alerts_bp, url_prefix="/api/ml")
 
 app.register_blueprint(ml_bp, url_prefix="/api/ml")
 
 if __name__ == "__main__":
+    start_scheduler()
     app.run(debug=True)

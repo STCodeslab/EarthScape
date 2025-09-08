@@ -1,2 +1,0 @@
-datetime,city,latitude,longitude,zoom,x,y,date,gibs_url
-2025-08-21T18:41:15.625490+00:00,dubai,42.9799691,17.4908381,6,35,8,2025-01-01,https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/2025-01-01/250m/6/8/35.jpg

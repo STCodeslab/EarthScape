@@ -18,6 +18,15 @@ venv\Scripts\python.exe -m pip install statsmodels
 
 venv\Scripts\python.exe -m pip install metostat
 
+venv\Scripts\python.exe -m pip install celery[redis]
+
+venv\Scripts\python.exe celery -A celery_app.celery worker --loglevel=info
+
+venv\Scripts\python.exe -m pip install apscheduler
+
+Do you want me to also make the alerts push immediately to frontend (via /api/alerts/stream using Server-Sent Events) so you can see alerts live in your presentation?
+
+
 venv\Scripts\python.exe app.py
 
 
@@ -42,59 +51,6 @@ I wanted to share the API keys I found:
 Weather API Key: d8e33cdc9998b6b507b37b5ffc2b8c04
 
 NASA API Key: KKaQCh3JRSjwRgudTliaFv9offkF5towGJRYQYeY
-
-User Authentication and Authorization:
-Implement a secure authentication system for users with different roles (e.g., administrators, analysts).
-Define access controls to restrict data access based on user roles and responsibilities.
-
-Data Ingestion:
-The system should support the ingestion of diverse climate-related datasets, including satellite imagery, weather station records, and environmental sensor data.
-Implement mechanisms to handle both historical and real-time data sources.
-Ensure compatibility with common data formats used in climate science.
-
-Data Storage:
-Utilize the Hadoop Distributed File System (HDFS) for scalable and fault-tolerant storage of large climate datasets.
-Implement data partitioning and organization strategies to optimize retrieval and processing.
-
-Data Processing:
-
-Implement Hadoop MapReduce jobs for parallel processing of climate data across distributed nodes.
-Develop algorithms for the identification of climate patterns, anomalies, and correlations.
-Include mechanisms to handle missing or incomplete data gracefully.
-
-Real-time Data Processing:
-
-Integrate real-time data streaming capabilities.
-Ensure seamless integration with batch processing for a comprehensive analysis.
-
- 
-Machine Learning Models:
-Develop machine learning models for predictive analysis of climate trends and impacts.
-Include algorithms for anomaly detection, trend prediction, and correlation analysis.
-Regularly update and refine models based on the latest available data.
-
-Data Visualization:
-Create interactive dashboards.
-Develop visual representations of climate patterns, anomalies, and predictions.
-Provide customizable and user-friendly interfaces for stakeholders to explore data
-
-Notifications and Alerts:
-Set up automated notifications and alerts for stakeholders based on predefined thresholds for climate anomalies or significant events.
-Enable configurable alerting mechanisms to notify users in real-time.
-
-Feedback and Support:
-A support system for users to contact for assistance, report issues, and provide feedback.
-
-
-authentication requirment is completed
-
-ingetion is also completed we can upload csv dataset to the mongodb database and we can also fetch real time data convert it into csv and upload it on mongodb database an we are also fetching sattelite imagery from API and sotring it on mongodb database is indestion is completed
-
-lets move on to next requirement and note we are using mongoDb instead of hadoop
-
-
-
-
 
 
 

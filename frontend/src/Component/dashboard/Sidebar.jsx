@@ -75,7 +75,7 @@ const Sidebar = () => {
   {role === "admin" && (
     <li className="treeview">
       <a href="#">
-        <i className="fa fa-user-shield"></i>
+           <i className="fa fa-user"></i>
         <span>Admin</span>
         <span className="pull-right-container">
           <i className="fa fa-angle-right pull-right"></i>
@@ -202,6 +202,11 @@ const Sidebar = () => {
     <li>
       <Link to="/model-list">
         <i className="fa fa-list"></i> <span>Models List</span>
+      </Link>
+    </li>
+     <li>
+      <Link to="/create-alert">
+        <i className="fa fa-bell"></i> <span>Create Alert</span>
       </Link>
     </li>
   </ul>

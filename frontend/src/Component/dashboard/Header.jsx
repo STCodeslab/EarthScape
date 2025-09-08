@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import AlertsDropdown from "../realtimedata/AlertsDropdown "; // Adjust the path as needed
 import { toast } from "react-toastify";
 import { useNavigate, Navigate, Link } from "react-router-dom";
 
@@ -48,6 +49,7 @@ const Header = () => {
           <div className="logo-mini w-30">
             <span className="light-logo">
               {/* <img src="../images/logo-letter.png" alt="logo" /> */}
+             
             </span>
             <span className="dark-logo">
               {/* <img src="../images/logo-letter.png" alt="logo" /> */}
@@ -76,13 +78,16 @@ const Header = () => {
         {/* Right Menu */}
         <div className="navbar-custom-menu r-side">
           <ul className="nav navbar-nav">
+                 <AlertsDropdown />
             <li className="dropdown user user-menu">
+             
               <a
                 href="#"
                 className="waves-effect waves-light dropdown-toggle no-border p-5"
                 data-bs-toggle="dropdown"
                 title="User"
               >
+                
                 <img
                   className="avatar avatar-pill"
                   src="../images/avatar/3.jpg"

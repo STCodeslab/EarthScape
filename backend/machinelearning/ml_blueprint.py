@@ -1,27 +1,33 @@
 # ml_blueprint.py
-from flask import Blueprint, request, jsonify
+import jwt
+from db import db
+from statsmodels.tsa.stattools import acf
+from flask import Blueprint, request, jsonify, Response, stream_with_context
 from bson import ObjectId
-import os, io, json
+import os
+import io
+import json
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 import joblib
 from statsmodels.tsa.arima.model import ARIMA
 import warnings
-import datetime as dt
+from datetime import datetime, timezone
+import time
+# make sure this import is at the top
+from realtime.realtime_alerts import _broadcast
+
 
 warnings.filterwarnings("ignore")
 
-from statsmodels.tsa.stattools import acf
-# Reuse your existing app globals
-from db import db
-import jwt
 JWT_SECRET = os.getenv("JWT_SECRET", "supersecretkey")
 JWT_ALGO = os.getenv("JWT_ALGORITHM", "HS256")
 
 ml_bp = Blueprint("ml_bp", __name__)
 MODELS_DIR = os.path.join(os.getcwd(), "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
+
 
 def _auth_ok():
     auth_header = request.headers.get("Authorization")
@@ -42,12 +48,14 @@ def _auth_ok():
     except Exception as e:
         return (None, None, (str(e), 401))
 
+
 def _guess_time_column(df):
     candidates = ["timestamp", "time", "datetime", "date", "uploaded_at"]
     for c in candidates:
         if c in df.columns:
             return c
     return None
+
 
 def _load_timeseries_from_mongo(user_id, role, dataset_name=None, dataset_id=None, target_field=None):
     """
@@ -87,13 +95,15 @@ def _load_timeseries_from_mongo(user_id, role, dataset_name=None, dataset_id=Non
         raise ValueError("Records are empty")
 
     if target_field not in df.columns:
-        raise ValueError(f"target_field '{target_field}' not present in dataset")
+        raise ValueError(
+            f"target_field '{target_field}' not present in dataset")
 
     # choose time column
     tcol = _guess_time_column(df)
     if tcol is None:
         # fallback: use index order if no timestamp; still construct a pseudo time
-        df["_pseudo_time"] = pd.date_range(end=pd.Timestamp.utcnow(), periods=len(df), freq="min")
+        df["_pseudo_time"] = pd.date_range(
+            end=pd.Timestamp.utcnow(), periods=len(df), freq="min")
         tcol = "_pseudo_time"
 
     # coerce types
@@ -108,6 +118,7 @@ def _load_timeseries_from_mongo(user_id, role, dataset_name=None, dataset_id=Non
     # return tidy
     return pd.DataFrame({"ts": df[tcol].values, "value": df[target_field].values})
 
+
 def _make_features(df, window=5):
     """
     Create simple, robust features for IsolationForest:
@@ -117,36 +128,58 @@ def _make_features(df, window=5):
     lag1 = s.diff().fillna(0.0)
     roll_mean = s.rolling(window, min_periods=1).mean()
     roll_std = s.rolling(window, min_periods=1).std().fillna(0.0)
-    X = np.column_stack([s.values, lag1.values, roll_mean.values, roll_std.values])
+    X = np.column_stack(
+        [s.values, lag1.values, roll_mean.values, roll_std.values])
     return X
 
-def _save_model_artifact(model, meta):
-    model_id = str(ObjectId())
+
+def _save_model_artifact(model, meta, model_id=None):
+    """
+    Saves or updates a model artifact.
+    - If model_id is None → insert a new document.
+    - If model_id is given → overwrite existing doc.
+    """
+    if model_id is None:
+        model_id = str(ObjectId())  # new model
     path = os.path.join(MODELS_DIR, f"{model_id}.pkl")
     joblib.dump({"model": model, "meta": meta}, path)
+
     meta_doc = {
-        "_id": ObjectId(model_id),
         "type": "anomaly_isoforest",
-        "created_at": dt.datetime.utcnow(),
+        "updated_at": datetime.now(timezone.utc),
         "path": path,
         **meta
     }
-    db.models.insert_one(meta_doc)
+
+    if "_id" not in meta_doc:
+        meta_doc["_id"] = ObjectId(model_id)
+        meta_doc["created_at"] = datetime.now(timezone.utc)
+
+    # If retrain → update existing
+    db.models.update_one(
+        {"_id": ObjectId(model_id)},
+        {"$set": meta_doc},
+        upsert=True
+    )
     return model_id
+
 
 def _load_model_artifact(model_id, ensure_type="anomaly_isoforest"):
     doc = db.models.find_one({"_id": ObjectId(model_id)})
     if not doc:
         raise ValueError("Model not found")
     if ensure_type and doc.get("type") != ensure_type:
-        raise ValueError(f"Model type mismatch: expected {ensure_type}, got {doc.get('type')}")
+        raise ValueError(
+            f"Model type mismatch: expected {ensure_type}, got {doc.get('type')}")
     blob = joblib.load(doc["path"])
     return blob["model"], blob["meta"], doc
+
 
 @ml_bp.route("/models", methods=["GET"])
 def list_models():
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     q = {} if role == "admin" else {"user_id": ObjectId(user_id)}
     cur = db.models.find(q).sort("created_at", -1)
@@ -162,13 +195,55 @@ def list_models():
         })
     return jsonify({"models": out}), 200
 
+
+# ml_blueprint.py
+
+def train_anomaly_model(user_id, role, dataset_name=None, dataset_id=None, target_field=None, contamination=0.02, model_id=None):
+    tsdf = _load_timeseries_from_mongo(
+        user_id, role, dataset_name, dataset_id, target_field)
+    if len(tsdf) < 20:
+        raise ValueError("Not enough data to train (min 20 rows)")
+
+    X = _make_features(tsdf)
+    model = IsolationForest(
+        n_estimators=200, contamination=contamination, random_state=42)
+    model.fit(X)
+
+    raw_scores = model.decision_function(X)
+    preds = model.predict(X)
+    anomaly_rate = float((preds == -1).mean())
+
+    meta = {
+        "user_id": ObjectId(user_id),
+        "role": role,
+        "dataset_name": dataset_name,
+        "dataset_id": ObjectId(dataset_id) if dataset_id else None,
+        "target_field": target_field,
+        "contamination": contamination,
+        "feature_window": 5,
+        "metrics": {
+            "train_rows": int(len(X)),
+            "anomaly_rate": anomaly_rate,
+            "score_min": float(np.min(raw_scores)),
+            "score_max": float(np.max(raw_scores)),
+            "score_mean": float(np.mean(raw_scores)),
+        }
+    }
+
+    model_id = _save_model_artifact(model, meta, model_id=model_id)
+    return model_id, meta
+
+
+
+
+# --------------------------
+# /anomaly/train endpoint
+# --------------------------
 @ml_bp.route("/anomaly/train", methods=["POST"])
 def anomaly_train():
-    """
-    Train IsolationForest for anomaly detection.
-    """
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     payload = request.get_json(force=True)
     dataset_name = payload.get("dataset_name")
@@ -180,93 +255,64 @@ def anomaly_train():
         return jsonify({"error": "target_field and (dataset_name or dataset_id) are required"}), 400
 
     try:
-        tsdf = _load_timeseries_from_mongo(user_id, role, dataset_name, dataset_id, target_field)
-        if len(tsdf) < 20:
-            return jsonify({"error": "Not enough data to train (min 20 rows)"}), 400
-
-        X = _make_features(tsdf)
-        model = IsolationForest(n_estimators=200, contamination=contamination, random_state=42)
-        model.fit(X)
-
-        raw_scores = model.decision_function(X)
-        preds = model.predict(X)
-        anomaly_rate = float((preds == -1).mean())
-
-        meta = {
-            "user_id": ObjectId(user_id),
-            "role": role,
-            "dataset_name": dataset_name,
-            "dataset_id": ObjectId(dataset_id) if dataset_id else None,
-            "target_field": target_field,
-            "contamination": contamination,
-            "feature_window": 5,
-            "metrics": {
-                "train_rows": int(len(X)),
-                "anomaly_rate": anomaly_rate,
-                "score_min": float(np.min(raw_scores)),
-                "score_max": float(np.max(raw_scores)),
-                "score_mean": float(np.mean(raw_scores)),
-            }
-        }
-
-        model_id = _save_model_artifact(model, meta)
-
-        # --- ALERT CHECK + LOG ---
-        triggered = []
-        if len(tsdf) > 0:
-            latest_val = float(tsdf["value"].iloc[-1])
-            latest_ts = tsdf["ts"].iloc[-1]
-            active_alerts = list(db.alerts.find({
-                "user_id": ObjectId(user_id),
-                "dataset_name": dataset_name,
-                "field": target_field,
-                "active": True
-            }))
-            for alert in active_alerts:
-                trig = None
-                if alert["threshold_type"] == "above" and latest_val > alert["threshold_value"]:
-                    trig = f">{alert['threshold_value']}"
-                elif alert["threshold_type"] == "below" and latest_val < alert["threshold_value"]:
-                    trig = f"<{alert['threshold_value']}"
-
-                if trig:
-                    log_doc = {
-                        "alert_id": alert["_id"],
-                        "user_id": ObjectId(user_id),
-                        "dataset_name": dataset_name,
-                        "field": target_field,
-                        "value": latest_val,
-                        "ts": latest_ts,
-                        "triggered_at": datetime.utcnow(),
-                        "source": "anomaly_train"
-                    }
-                    db.alert_logs.insert_one(log_doc)
-
-                    triggered.append({
-                        "alert_id": str(alert["_id"]),
-                        "rule": trig,
-                        "value": latest_val,
-                        "ts": latest_ts.isoformat()
-                    })
+        model_id, meta = train_anomaly_model(
+            user_id, role, dataset_name, dataset_id, target_field, contamination)
+        model, _, _ = _load_model_artifact(model_id)
+        detect_anomalies_and_trigger(
+            user_id, role, dataset_name, dataset_id, target_field, model=model)
 
         return jsonify({
             "model_id": model_id,
             "type": "anomaly_isoforest",
-            "metrics": meta["metrics"],
-            "alerts_triggered": triggered
+            "metrics": meta["metrics"]
         }), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# --------------------------
+# Detect latest anomaly and trigger alert
+# --------------------------
+def detect_anomalies_and_trigger(user_id, role, dataset_name, dataset_id=None, target_field=None, model=None):
+    tsdf = _load_timeseries_from_mongo(user_id, role, dataset_name, dataset_id, target_field)
+    if len(tsdf) == 0:
+        return []
 
+    X = _make_features(tsdf)
+    preds = model.predict(X)
+
+    triggered_alerts = []
+
+    # Trigger alert if latest value is an anomaly
+    if preds[-1] == -1:
+        latest_val = tsdf["value"].iloc[-1]
+        latest_ts = tsdf["ts"].iloc[-1]
+        alert_entry = {
+            "alert_id": None,
+            "dataset_name": dataset_name,
+            "field": target_field,
+            "value": float(latest_val),
+            "ts": pd.to_datetime(latest_ts),
+            "triggered_at": datetime.now(timezone.utc),
+            "user_id": ObjectId(user_id),
+            "role": role,
+            "source": "anomaly_model",
+            "rule": "IsolationForest anomaly"
+        }
+        db.alert_logs.insert_one(alert_entry)
+        _broadcast("alerts", alert_entry)
+        triggered_alerts.append(alert_entry)
+
+    return triggered_alerts
+
+
+# --------------------------
+# /anomaly/score endpoint
+# --------------------------
 @ml_bp.route("/anomaly/score", methods=["POST"])
 def anomaly_score():
-    """
-    Score dataset or new point(s) for anomalies.
-    """
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     payload = request.get_json(force=True)
     model_id = payload.get("model_id")
@@ -312,8 +358,9 @@ def anomaly_score():
                 "is_anomaly": bool(preds[i] == -1)
             })
 
-        # --- ALERT CHECK + LOG ---
         triggered = []
+
+        # Manual threshold alerts
         if len(out) > 0:
             latest_val = out[-1]["value"]
             latest_ts = out[-1]["ts"]
@@ -338,17 +385,35 @@ def anomaly_score():
                         "field": meta["target_field"],
                         "value": latest_val,
                         "ts": latest_ts,
-                        "triggered_at": datetime.utcnow(),
+                        "triggered_at": datetime.now(timezone.utc),
                         "source": "anomaly_score"
                     }
                     db.alert_logs.insert_one(log_doc)
-
+                    _broadcast("alerts", log_doc)
                     triggered.append({
                         "alert_id": str(alert["_id"]),
                         "rule": trig,
                         "value": latest_val,
                         "ts": latest_ts
                     })
+
+        # IsolationForest anomaly alert (always triggers if anomaly)
+        anomaly_triggered = detect_anomalies_and_trigger(
+            user_id=user_id,
+            role=role,
+            dataset_name=meta["dataset_name"],
+            dataset_id=str(meta.get("dataset_id")) if meta.get("dataset_id") else None,
+            target_field=meta["target_field"],
+            model=model
+        )
+
+        for a in anomaly_triggered:
+            triggered.append({
+                "alert_id": str(a.get("alert_id")) if a.get("alert_id") else None,
+                "rule": a.get("rule"),
+                "value": a.get("value"),
+                "ts": a.get("triggered_at").isoformat()
+            })
 
         return jsonify({
             "results": out[-(int(latest_n) if latest_n else len(out)):],
@@ -390,15 +455,14 @@ def delete_model(model_id):
         return jsonify({"error": str(e)}), 500
 
 
-
-
 # ========= STEP 2: FORECASTING =========
 
 def _infer_freq(ts: pd.Series):
     # Try pandas to infer; fallback to median diff in minutes
     freq = pd.infer_freq(ts)
     if freq is None and len(ts) >= 3:
-        diffs = pd.Series(ts.sort_values().diff().dropna().values).dt.total_seconds()
+        diffs = pd.Series(ts.sort_values().diff(
+        ).dropna().values).dt.total_seconds()
         if not diffs.empty:
             med = diffs.median()
             # map common seconds to pandas freq strings
@@ -415,9 +479,11 @@ def _infer_freq(ts: pd.Series):
             freq = mapping[closest]
     return freq  # may still be None; ARIMA can handle but forecasting index will be range
 
+
 def _to_timeseries(tsdf: pd.DataFrame):
     """Ensure a proper time-indexed series returned as (y, index, freq)."""
-    s = pd.Series(tsdf["value"].astype(float).values, index=pd.to_datetime(tsdf["ts"], utc=True))
+    s = pd.Series(tsdf["value"].astype(float).values,
+                  index=pd.to_datetime(tsdf["ts"], utc=True))
     s = s.sort_index()
 
     # 🚀 FIX: handle duplicate timestamps
@@ -432,6 +498,7 @@ def _to_timeseries(tsdf: pd.DataFrame):
         s = s.asfreq(freq)
         s = s.interpolate(limit_direction="both")
     return s, freq
+
 
 @ml_bp.route("/forecast/train", methods=["POST"])
 def forecast_train():
@@ -448,7 +515,8 @@ def forecast_train():
     }
     """
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     body = request.get_json(force=True)
     dataset_name = body.get("dataset_name")
@@ -462,7 +530,8 @@ def forecast_train():
         return jsonify({"error": "target_field and (dataset_name or dataset_id) are required"}), 400
 
     try:
-        tsdf = _load_timeseries_from_mongo(user_id, role, dataset_name, dataset_id, target_field)
+        tsdf = _load_timeseries_from_mongo(
+            user_id, role, dataset_name, dataset_id, target_field)
         if len(tsdf) < 20:
             return jsonify({"error": "Not enough data to train (min 20 rows)"}), 400
 
@@ -479,7 +548,8 @@ def forecast_train():
                         m = ARIMA(y, order=(p, d, q))
                         res = m.fit()
                         if res.aic < best["aic"]:
-                            best = {"aic": res.aic, "order": (p, d, q), "model": res}
+                            best = {"aic": res.aic, "order": (
+                                p, d, q), "model": res}
                     except Exception:
                         continue
 
@@ -518,6 +588,7 @@ def forecast_train():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @ml_bp.route("/forecast/predict", methods=["POST"])
 def forecast_predict():
     """
@@ -540,7 +611,8 @@ def forecast_predict():
         return jsonify({"error": "model_id is required"}), 400
 
     try:
-        model, meta, model_doc = _load_model_artifact(model_id, ensure_type="forecast_arima")
+        model, meta, model_doc = _load_model_artifact(
+            model_id, ensure_type="forecast_arima")
 
         # permissions
         if role != "admin" and str(model_doc.get("user_id")) != str(user_id):
@@ -548,10 +620,12 @@ def forecast_predict():
 
         # Rebuild series
         tsdf = _load_timeseries_from_mongo(
-            user_id=user_id if role != "admin" else str(model_doc.get("user_id")),
+            user_id=user_id if role != "admin" else str(
+                model_doc.get("user_id")),
             role=role if role != "admin" else "admin",
             dataset_name=meta.get("dataset_name"),
-            dataset_id=str(meta.get("dataset_id")) if meta.get("dataset_id") else None,
+            dataset_id=str(meta.get("dataset_id")) if meta.get(
+                "dataset_id") else None,
             target_field=meta["target_field"]
         )
         y, freq = _to_timeseries(tsdf)
@@ -575,7 +649,8 @@ def forecast_predict():
 
         out = []
         for i in range(horizon):
-            ts_val = (idx[i].isoformat() if hasattr(idx[i], "isoformat") else int(idx[i]))
+            ts_val = (idx[i].isoformat() if hasattr(
+                idx[i], "isoformat") else int(idx[i]))
             out.append({
                 "ts": ts_val,
                 "yhat": float(mean.iloc[i]),
@@ -612,7 +687,7 @@ def forecast_predict():
                         "field": meta["target_field"],
                         "value": latest_val,
                         "ts": latest_ts,
-                        "triggered_at": dt.datetime.utcnow(),
+                        "triggered_at": datetime.now(timezone.utc),
                         "source": "forecast_predict"   # <--- added like anomaly_train
                     }
                     db.alert_logs.insert_one(log_doc)
@@ -652,7 +727,8 @@ def correlation_autocorr():
     }
     """
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     body = request.get_json(force=True)
     dataset_name = body.get("dataset_name")
@@ -662,11 +738,13 @@ def correlation_autocorr():
         return jsonify({"error": "dataset_name and target_field required"}), 400
 
     try:
-        tsdf = _load_timeseries_from_mongo(user_id, role, dataset_name, target_field=target_field)
+        tsdf = _load_timeseries_from_mongo(
+            user_id, role, dataset_name, target_field=target_field)
         y, freq = _to_timeseries(tsdf)
 
         acf_vals = acf(y, nlags=max_lag, fft=True)
-        out = [{"lag": i, "corr": float(acf_vals[i])} for i in range(len(acf_vals))]
+        out = [{"lag": i, "corr": float(acf_vals[i])}
+               for i in range(len(acf_vals))]
 
         return jsonify({"dataset_name": dataset_name, "target_field": target_field, "acf": out}), 200
     except Exception as e:
@@ -685,11 +763,14 @@ def correlation_cross():
     }
     """
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     body = request.get_json(force=True)
-    d1, f1 = body.get("dataset1", {}).get("name"), body.get("dataset1", {}).get("field")
-    d2, f2 = body.get("dataset2", {}).get("name"), body.get("dataset2", {}).get("field")
+    d1, f1 = body.get("dataset1", {}).get(
+        "name"), body.get("dataset1", {}).get("field")
+    d2, f2 = body.get("dataset2", {}).get(
+        "name"), body.get("dataset2", {}).get("field")
     if not d1 or not f1 or not d2 or not f2:
         return jsonify({"error": "dataset1/dataset2 with name and field required"}), 400
 
@@ -701,7 +782,7 @@ def correlation_cross():
         y2, _ = _to_timeseries(ts2)
 
         df = pd.concat([y1, y2], axis=1).dropna()
-        corr = df.iloc[:,0].corr(df.iloc[:,1])
+        corr = df.iloc[:, 0].corr(df.iloc[:, 1])
 
         return jsonify({
             "dataset1": {"name": d1, "field": f1},
@@ -726,7 +807,8 @@ def correlation_matrix():
     }
     """
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     body = request.get_json(force=True)
     fields = body.get("fields", [])
@@ -738,7 +820,8 @@ def correlation_matrix():
         names = []
         for f in fields:
             ds, fld = f.get("dataset"), f.get("field")
-            ts = _load_timeseries_from_mongo(user_id, role, ds, target_field=fld)
+            ts = _load_timeseries_from_mongo(
+                user_id, role, ds, target_field=fld)
             y, _ = _to_timeseries(ts)
             dfs.append(y.rename(f"{ds}.{fld}"))
             names.append(f"{ds}.{fld}")
@@ -749,8 +832,6 @@ def correlation_matrix():
         return jsonify({"matrix": corr_matrix, "fields": names}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 
 
 # --- ALERTS SYSTEM ---
@@ -768,7 +849,8 @@ def create_alert():
     }
     """
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     body = request.get_json(force=True)
     dataset_name = body.get("dataset_name")
@@ -787,7 +869,7 @@ def create_alert():
         "threshold_type": threshold_type,
         "threshold_value": float(threshold_value),
         "active": True,
-        "created_at": datetime.utcnow()
+        "created_at": datetime.now(timezone.utc)
     }
     db.alerts.insert_one(alert_doc)
 
@@ -800,7 +882,8 @@ def fetch_alerts():
     Get all alerts for current user.
     """
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     alerts = list(db.alerts.find({"user_id": ObjectId(user_id)}))
     for a in alerts:
@@ -808,16 +891,17 @@ def fetch_alerts():
         a["user_id"] = str(a["user_id"])
     return jsonify({"alerts": alerts}), 200
 
-
 @ml_bp.route("/alerts/check", methods=["POST"])
 def check_alerts():
     """
-    Check all active alerts for current user and return triggered ones.
+    Check all active alerts for the current user, log them, and broadcast to SSE.
     """
     user_id, role, err = _auth_ok()
-    if err: return jsonify({"error": err[0]}), err[1]
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
-    active_alerts = list(db.alerts.find({"user_id": ObjectId(user_id), "active": True}))
+    active_alerts = list(db.alerts.find(
+        {"user_id": ObjectId(user_id), "active": True}))
     triggered = []
 
     for alert in active_alerts:
@@ -830,30 +914,47 @@ def check_alerts():
             )
             if len(tsdf) == 0:
                 continue
+
             latest_val = tsdf["value"].iloc[-1]
 
+            is_triggered = False
             if alert["threshold_type"] == "above" and latest_val > alert["threshold_value"]:
-                triggered.append({
-                    "alert_id": str(alert["_id"]),
-                    "dataset": alert["dataset_name"],
-                    "field": alert["field"],
-                    "value": float(latest_val),
-                    "rule": f">{alert['threshold_value']}"
-                })
+                rule_str = f">{alert['threshold_value']}"
+                is_triggered = True
             elif alert["threshold_type"] == "below" and latest_val < alert["threshold_value"]:
-                triggered.append({
+                rule_str = f"<{alert['threshold_value']}"
+                is_triggered = True
+
+            if is_triggered:
+                alert_entry = {
                     "alert_id": str(alert["_id"]),
-                    "dataset": alert["dataset_name"],
+                    "dataset_name": alert["dataset_name"],
                     "field": alert["field"],
                     "value": float(latest_val),
-                    "rule": f"<{alert['threshold_value']}"
-                })
+                    "triggered_at": datetime.now(timezone.utc),
+                    "user_id": ObjectId(user_id),
+                    "role": role,
+                    "source": "system",
+                    "rule": rule_str
+                }
+
+                # Insert into alert_logs
+                db.alert_logs.insert_one(alert_entry)
+
+                # Broadcast to SSE subscribers
+                _broadcast("alerts", alert_entry)
+
+                # Add to triggered list for API response
+                triggered.append(alert_entry)
+
         except Exception as e:
             print("Error checking alert:", e)
 
     return jsonify({"triggered": triggered}), 200
 
+
 @ml_bp.route("/alerts/logs", methods=["GET"])
+
 def get_alert_logs():
     """
     Fetch triggered alert logs for the authenticated user.
@@ -865,7 +966,7 @@ def get_alert_logs():
       ?alert_id=...      → filter by a specific alert
     """
     user_id, role, err = _auth_ok()
-    if err: 
+    if err:
         return jsonify({"error": err[0]}), err[1]
 
     try:
@@ -887,7 +988,8 @@ def get_alert_logs():
             except:
                 return jsonify({"error": "Invalid alert_id"}), 400
 
-        logs = list(db.alert_logs.find(query).sort("triggered_at", -1).limit(limit))
+        logs = list(db.alert_logs.find(query).sort(
+            "triggered_at", -1).limit(limit))
 
         out = []
         for log in logs:
