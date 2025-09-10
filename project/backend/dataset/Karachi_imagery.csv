@@ -1,0 +1,2 @@
+datetime,city,latitude,longitude,zoom,x,y,date,gibs_url
+2025-09-10T17:25:11.326721+00:00,Karachi,4.9205575,35.0842595,6,38,15,2025-07-01,https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/2025-07-01/250m/6/15/38.jpg
